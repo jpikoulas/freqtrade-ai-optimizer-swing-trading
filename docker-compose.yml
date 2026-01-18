@@ -1,0 +1,49 @@
+services:
+  freqtrade:
+    image: freqtrade-ai-optimizer-freqtrade:latest
+    build:
+      context: ${HOST_PROJECT_DIR:-.}
+      dockerfile: Dockerfile.freqtrade
+    volumes:
+      - ${HOST_PROJECT_DIR:-.}/user_data:/freqtrade/user_data
+      - ${HOST_PROJECT_DIR:-.}/config:/freqtrade/config
+    environment:
+      - FREQTRADE__EXCHANGE__KEY=${BINANCE_API_KEY:-}
+      - FREQTRADE__EXCHANGE__SECRET=${BINANCE_API_SECRET:-}
+    command: ["--help"]
+
+  optimizer:
+    build:
+      context: ${HOST_PROJECT_DIR:-.}
+      dockerfile: Dockerfile.optimizer
+    container_name: freqtrade-optimizer
+    volumes:
+      - ${HOST_PROJECT_DIR:-.}/user_data:/app/user_data
+      - ${HOST_PROJECT_DIR:-.}/config:/app/config
+      - ${HOST_PROJECT_DIR:-.}/strategies:/app/strategies
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - MAX_ITERATIONS=${MAX_ITERATIONS:-25}
+      - TARGET_PROFIT=${TARGET_PROFIT:-5.0}
+      - BACKTEST_DAYS=${BACKTEST_DAYS:-60}
+    depends_on:
+      - freqtrade
+    command: ["python", "main.py"]
+
+  download-data:
+    build:
+      context: ${HOST_PROJECT_DIR:-.}
+      dockerfile: Dockerfile.freqtrade
+    volumes:
+      - ${HOST_PROJECT_DIR:-.}/user_data:/freqtrade/user_data
+      - ${HOST_PROJECT_DIR:-.}/config:/freqtrade/config
+    command: >
+      download-data
+      --exchange binance
+      --pairs BTC/USDT ETH/USDT
+      --timeframe 1m 5m 15m
+      --days 60
+      --datadir /freqtrade/user_data/data
+    profiles:
+      - download

@@ -1,0 +1,17 @@
+FROM freqtradeorg/freqtrade:stable
+
+# Install FreqAI dependencies
+RUN pip install --no-cache-dir \
+    lightgbm \
+    scikit-learn \
+    joblib \
+    catboost \
+    xgboost \
+    tensorboard \
+    datasieve
+
+# Set working directory
+WORKDIR /freqtrade
+
+# Default command
+CMD ["trade"]
