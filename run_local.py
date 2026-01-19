@@ -70,7 +70,7 @@ def run_hyperopt(strategy_name="FreqAIStrategy", epochs=100):
         "--timerange", timerange,
         "--epochs", str(epochs),
         "--spaces", "roi", "stoploss", "trailing",
-        "--min-trades", "20",
+        "--min-trades", "10",  # Lower for swing trading (fewer trades expected)
         "-j", "4"  # Use 4 parallel jobs
     ]
 
@@ -223,10 +223,10 @@ def parse_results(results_path):
 
 
 def get_base_strategy():
-    """Return a proven base strategy that generates trades.
+    """Return a proven base swing trading strategy that generates trades.
 
-    This strategy uses simple RSI-based conditions that reliably trigger
-    trades in most market conditions. The AI will improve upon this foundation.
+    This strategy uses trend-following conditions on 1h timeframe.
+    Targets fewer, higher-quality trades with larger profit targets.
     """
     return '''import talib.abstract as ta
 from pandas import DataFrame
@@ -235,39 +235,50 @@ from freqtrade.strategy import IStrategy
 
 class FreqAIStrategy(IStrategy):
     INTERFACE_VERSION = 3
-    timeframe = "5m"
+    timeframe = "1h"
     can_short = False
 
-    # Loose ROI targets - let trades run
-    minimal_roi = {"0": 0.03, "60": 0.02, "120": 0.01}
-    stoploss = -0.05
+    # Swing trading ROI - let winners run
+    minimal_roi = {"0": 0.12, "72": 0.08, "168": 0.05, "336": 0.03}
+    stoploss = -0.06
     trailing_stop = True
-    trailing_stop_positive = 0.01
-    trailing_stop_positive_offset = 0.02
+    trailing_stop_positive = 0.03
+    trailing_stop_positive_offset = 0.05
     trailing_only_offset_is_reached = True
 
     process_only_new_candles = True
     use_exit_signal = True
     exit_profit_only = False
-    startup_candle_count: int = 30
+    startup_candle_count: int = 100
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
         dataframe["ema_20"] = ta.EMA(dataframe, timeperiod=20)
         dataframe["ema_50"] = ta.EMA(dataframe, timeperiod=50)
+        dataframe["ema_100"] = ta.EMA(dataframe, timeperiod=100)
+        dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
+        macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
+        dataframe["macd"] = macd["macd"]
+        dataframe["macdsignal"] = macd["macdsignal"]
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # Simple entry: RSI recovering from oversold OR price above trend
+        # Trend following entry with confirmation
         dataframe.loc[
             (
-                (dataframe["rsi"] < 45) &
-                (dataframe["rsi"] > 25) &
+                (dataframe["close"] > dataframe["ema_50"]) &
+                (dataframe["ema_20"] > dataframe["ema_50"]) &
+                (dataframe["rsi"] > 40) &
+                (dataframe["rsi"] < 70) &
+                (dataframe["macd"] > dataframe["macdsignal"]) &
                 (dataframe["volume"] > 0)
             ) |
             (
-                (dataframe["close"] > dataframe["ema_20"]) &
-                (dataframe["rsi"] < 60) &
+                # Pullback entry in uptrend
+                (dataframe["close"] > dataframe["ema_100"]) &
+                (dataframe["close"] < dataframe["ema_20"]) &
+                (dataframe["rsi"] < 45) &
+                (dataframe["rsi"] > 30) &
                 (dataframe["volume"] > 0)
             ),
             "enter_long"
@@ -275,12 +286,13 @@ class FreqAIStrategy(IStrategy):
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # Exit on overbought OR below trend
+        # Exit on overbought or trend reversal
         dataframe.loc[
-            (dataframe["rsi"] > 70) |
+            (dataframe["rsi"] > 75) |
             (
+                (dataframe["ema_20"] < dataframe["ema_50"]) &
                 (dataframe["close"] < dataframe["ema_50"]) &
-                (dataframe["rsi"] < 40)
+                (dataframe["macd"] < dataframe["macdsignal"])
             ),
             "exit_long"
         ] = 1
@@ -295,33 +307,34 @@ def generate_improved_strategy(client, current_strategy, results, iteration, hyp
     issues = []
     suggestions = []
 
-    # Determine priority based on current state
+    # Determine priority based on current state - SWING TRADING expectations
+    # On 1h timeframe over 90 days, expect 10-50 trades (not 200+)
     if results["total_trades"] == 0:
         issues.append("CRITICAL: Zero trades generated!")
         suggestions.append("Your entry conditions are TOO STRICT. You MUST simplify them.")
-        suggestions.append("Use ONLY 3-4 simple conditions: EMA crossover + RSI range + MACD signal + volume > 0")
-        suggestions.append("DO NOT use .shift() comparisons or momentum indicators - they are too restrictive")
-        suggestions.append("Widen RSI range: use (rsi > 30) & (rsi < 70) instead of narrow ranges")
-    elif results["total_trades"] < 20:
-        issues.append(f"Too few trades ({results['total_trades']}) - need at least 30 for statistics")
-        suggestions.append("Loosen entry conditions - widen RSI thresholds")
-    elif results["total_trades"] > 300:
-        issues.append(f"Too many trades ({results['total_trades']}) - overtrading")
-        suggestions.append("Add one trend filter to reduce noise")
+        suggestions.append("Use 3-4 simple conditions: EMA trend + RSI range + MACD signal + volume > 0")
+        suggestions.append("DO NOT use .shift() comparisons - they are too restrictive")
+        suggestions.append("Widen RSI range: use (rsi > 35) & (rsi < 70) instead of narrow ranges")
+    elif results["total_trades"] < 5:
+        issues.append(f"Too few trades ({results['total_trades']}) - need at least 10 for swing trading statistics")
+        suggestions.append("Loosen entry conditions - widen RSI thresholds or add alternative entry (pullback)")
+    elif results["total_trades"] > 100:
+        issues.append(f"Too many trades ({results['total_trades']}) - overtrading for swing strategy")
+        suggestions.append("Add stronger trend filter (ADX > 25) or require price above ema_100")
     elif results["total_profit_pct"] < 0:
         issues.append(f"Strategy losing money ({results['total_profit_pct']:.2f}%)")
-        if results["win_rate"] < 40:
-            suggestions.append(f"Low win rate ({results['win_rate']:.1f}%) - add trend confirmation (price > ema_21)")
+        if results["win_rate"] < 45:
+            suggestions.append(f"Low win rate ({results['win_rate']:.1f}%) - add trend confirmation (ema_20 > ema_50)")
         else:
-            suggestions.append("Exits may be too early - raise RSI exit threshold to 75")
+            suggestions.append("Exits may be too early - let winners run longer, raise RSI exit to 75+")
     else:
         issues.append(f"Strategy profitable at {results['total_profit_pct']:.2f}% - fine-tune for better performance")
         if results["win_rate"] < 50:
-            suggestions.append("Add one more quality filter to improve win rate")
+            suggestions.append("Add ADX filter (adx > 20) to improve trade quality")
 
-    if results["max_drawdown_pct"] > 20:
+    if results["max_drawdown_pct"] > 15:
         issues.append(f"High drawdown ({results['max_drawdown_pct']:.2f}%)")
-        suggestions.append("Consider tighter stoploss or trend filter")
+        suggestions.append("Consider adding trend filter or tighter trailing stop")
 
     analysis = "\n".join(f"- {i}" for i in issues)
     suggestion_text = "\n".join(f"- {s}" for s in suggestions) if suggestions else "- Continue current approach"
@@ -336,59 +349,74 @@ HYPEROPT OPTIMIZED PARAMETERS (use these exact values):
 Apply these to minimal_roi, stoploss, and trailing_stop settings.
 """
 
-    # Build system prompt - emphasize GENERATING TRADES as priority #1
-    system_prompt = """You are an expert FreqTrade strategy developer. Your task is to generate a WORKING trading strategy.
+    # Build system prompt - SWING TRADING on 1h timeframe
+    system_prompt = """You are an expert FreqTrade SWING TRADING strategy developer. Your task is to generate a WORKING 1-hour timeframe strategy.
+
+SWING TRADING PRINCIPLES:
+- Timeframe: 1h (MUST use timeframe = "1h")
+- Target: 5-15% profit per trade, held for days to weeks
+- Fewer trades (10-50 over 90 days) but higher quality
+- Let winners run with trailing stops
+- Use longer EMAs (20, 50, 100, 200) for trend identification
 
 ABSOLUTE PRIORITY #1: THE STRATEGY MUST GENERATE TRADES!
-A strategy with 0 trades is USELESS. It's better to have 100 losing trades than 0 trades.
+A strategy with 0 trades is USELESS. Better to have losing trades than no trades.
 
 CODE REQUIREMENTS:
 1. Return ONLY valid Python code - no explanations, no markdown, no ```
 2. Class name MUST be 'FreqAIStrategy'
-3. Every indicator used in entry/exit MUST be defined in populate_indicators()
-4. Use ONLY: ta.RSI, ta.MACD, ta.EMA, ta.SMA, ta.ATR, ta.ADX, ta.BBANDS
-5. BBANDS must use floats: ta.BBANDS(dataframe, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
+3. timeframe MUST be "1h"
+4. Every indicator used in entry/exit MUST be defined in populate_indicators()
+5. Use ONLY: ta.RSI, ta.MACD, ta.EMA, ta.SMA, ta.ATR, ta.ADX, ta.BBANDS
+6. BBANDS must use floats: ta.BBANDS(dataframe, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
 
-ENTRY CONDITIONS - KEEP IT SIMPLE:
-- Use 3-4 conditions MAX connected with &
-- Use | (OR) to create multiple entry opportunities
-- GOOD: (ema_8 > ema_21) & (rsi > 30) & (rsi < 70) & (volume > 0)
-- BAD: More than 5 conditions = zero trades
+ENTRY CONDITIONS - SWING TRADING:
+- Use 3-5 conditions connected with &
+- Use | (OR) for alternative entries (trend following + pullback)
+- GOOD: (close > ema_50) & (ema_20 > ema_50) & (rsi > 40) & (rsi < 70) & (macd > macdsignal)
+- BAD: More than 6 conditions = zero trades
 - BAD: Using .shift() comparisons = often zero trades
-- BAD: Narrow RSI ranges like (rsi > 45) & (rsi < 55) = zero trades
+- BAD: Narrow RSI ranges like (rsi > 50) & (rsi < 55) = zero trades
 
-WORKING ENTRY EXAMPLE:
+WORKING SWING ENTRY EXAMPLE:
     dataframe.loc[
         (
-            (dataframe["ema_8"] > dataframe["ema_21"]) &
-            (dataframe["rsi"] > 30) & (dataframe["rsi"] < 70) &
+            # Trend following
+            (dataframe["close"] > dataframe["ema_50"]) &
+            (dataframe["ema_20"] > dataframe["ema_50"]) &
+            (dataframe["rsi"] > 40) & (dataframe["rsi"] < 70) &
             (dataframe["macd"] > dataframe["macdsignal"]) &
             (dataframe["volume"] > 0)
         ) |
         (
-            (dataframe["rsi"] < 30) &
-            (dataframe["close"] < dataframe["bb_lower"]) &
+            # Pullback entry
+            (dataframe["close"] > dataframe["ema_100"]) &
+            (dataframe["close"] < dataframe["ema_20"]) &
+            (dataframe["rsi"] < 45) & (dataframe["rsi"] > 30) &
             (dataframe["volume"] > 0)
         ),
         "enter_long"
     ] = 1
 
-WORKING EXIT EXAMPLE:
+WORKING SWING EXIT EXAMPLE:
     dataframe.loc[
-        (dataframe["rsi"] > 70) |
+        (dataframe["rsi"] > 75) |
         (
-            (dataframe["ema_8"] < dataframe["ema_21"]) &
+            (dataframe["ema_20"] < dataframe["ema_50"]) &
+            (dataframe["close"] < dataframe["ema_50"]) &
             (dataframe["macd"] < dataframe["macdsignal"])
         ),
         "exit_long"
     ] = 1
 
-DEFAULT SETTINGS:
-    minimal_roi = {"0": 0.02, "30": 0.01, "60": 0.005}
-    stoploss = -0.03
+DEFAULT SWING SETTINGS:
+    minimal_roi = {"0": 0.12, "72": 0.08, "168": 0.05, "336": 0.03}
+    stoploss = -0.06
     trailing_stop = True
-    trailing_stop_positive = 0.01
-    trailing_stop_positive_offset = 0.02"""
+    trailing_stop_positive = 0.03
+    trailing_stop_positive_offset = 0.05
+    trailing_only_offset_is_reached = True
+    startup_candle_count = 100"""
 
     # Build user prompt with clear instructions
     zero_trade_warning = ""
@@ -419,7 +447,7 @@ ISSUES:
 WHAT TO DO:
 {suggestion_text}
 {hyperopt_context}
-TARGET: Generate 30-100 trades with positive profit over 60 days.
+TARGET: Generate 10-50 swing trades with positive profit over 90 days on 1h timeframe.
 
 Return ONLY the complete Python code. No explanations."""
 
@@ -488,9 +516,9 @@ def main():
     shutil.copy2(initial_strategy, USER_DATA_DIR / "strategies" / "FreqAIStrategy.py")
 
     print("=" * 60)
-    print("FreqTrade AI Strategy Optimizer (Hyperopt + DeepSeek)")
+    print("FreqTrade SWING TRADING Optimizer (Hyperopt + DeepSeek)")
     print("=" * 60)
-    print(f"Timeframe: 5m")
+    print(f"Timeframe: 1h (Swing Trading)")
     print(f"Target profit: {TARGET_PROFIT}%")
     print(f"Max iterations: {MAX_ITERATIONS}")
     print(f"Hyperopt epochs per iteration: {HYPEROPT_EPOCHS}")
@@ -568,8 +596,8 @@ def main():
             best_strategy = current_strategy
             print(f"  *** New best: {best_profit:.2f}% ***")
 
-        # Check target
-        if results["total_profit_pct"] >= TARGET_PROFIT and results["total_trades"] >= 20:
+        # Check target - lower trade requirement for swing trading
+        if results["total_profit_pct"] >= TARGET_PROFIT and results["total_trades"] >= 10:
             print(f"\n{'='*60}")
             print(f"TARGET ACHIEVED! Profit: {results['total_profit_pct']:.2f}%")
             print(f"{'='*60}")
@@ -583,7 +611,7 @@ def main():
 
         # Step 2: Run hyperopt ONLY if we have trades (otherwise it's useless)
         hyperopt_params = None
-        if results["total_trades"] >= 20:
+        if results["total_trades"] >= 10:  # Lower threshold for swing trading
             print("\nStep 2: Running hyperopt for parameter optimization...")
             success, output = run_hyperopt(epochs=HYPEROPT_EPOCHS)
             if success:

@@ -55,12 +55,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         -f|--forever)
             RUN_FOREVER=true
-            MAX_ITERATIONS=999999
+            # Keep MAX_ITERATIONS at user-specified value (or default)
+            # The shell script will loop until target is reached
             shift
             ;;
         --status)
             # Show status of running optimizer
-            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-optimizer")
+            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
             if [ -n "$CONTAINER_ID" ]; then
                 echo "Optimizer is running (container: $CONTAINER_ID)"
                 echo ""
@@ -73,7 +74,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --logs)
             # Follow logs of running optimizer
-            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-optimizer")
+            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
             if [ -n "$CONTAINER_ID" ]; then
                 sudo docker logs -f "$CONTAINER_ID"
             else
@@ -84,7 +85,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --stop)
             # Stop running optimizer
-            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-optimizer")
+            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
             if [ -n "$CONTAINER_ID" ]; then
                 echo "Stopping optimizer..."
                 sudo docker stop "$CONTAINER_ID"
@@ -155,7 +156,7 @@ if ! sudo docker info > /dev/null 2>&1; then
 fi
 
 # Check if optimizer is already running
-EXISTING_CONTAINER=$(sudo docker ps -q --filter "name=freqtrade-optimizer")
+EXISTING_CONTAINER=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
 if [ -n "$EXISTING_CONTAINER" ]; then
     echo "WARNING: Optimizer is already running (container: $EXISTING_CONTAINER)"
     echo "Use --stop to stop it first, or --logs to view its output"
@@ -167,10 +168,10 @@ echo "Building freqtrade image..."
 sudo docker compose build freqtrade
 
 # Build the optimizer image if needed
-OPTIMIZER_IMAGE="freqtrade-ai-optimizer-runner:latest"
+OPTIMIZER_IMAGE="freqtrade-swing-optimizer-runner:latest"
 
 echo "============================================================"
-echo "FreqTrade AI Strategy Optimizer"
+echo "FreqTrade SWING TRADING Optimizer"
 echo "============================================================"
 echo "Settings:"
 echo "  Max Iterations:  $MAX_ITERATIONS"
@@ -254,7 +255,7 @@ fi
 
 # Build docker run command
 DOCKER_CMD="sudo docker run --rm \
-    --name freqtrade-optimizer \
+    --name freqtrade-swing-optimizer \
     -v $SCRIPT_DIR/user_data:/app/user_data \
     -v $SCRIPT_DIR/config:/app/config \
     -v $SCRIPT_DIR/strategies:/app/strategies \
@@ -271,19 +272,80 @@ DOCKER_CMD="sudo docker run --rm \
     --network host \
     $OPTIMIZER_IMAGE"
 
+# Function to check if target profit was achieved
+check_target_achieved() {
+    if [ -f "$SCRIPT_DIR/user_data/optimization_report.json" ]; then
+        # Extract best_profit from the report
+        BEST_PROFIT=$(python3 -c "import json; r=json.load(open('$SCRIPT_DIR/user_data/optimization_report.json')); print(r.get('summary',{}).get('best_profit', -999))" 2>/dev/null || echo "-999")
+        # Compare with target (using python for float comparison)
+        TARGET_MET=$(python3 -c "print('yes' if float('$BEST_PROFIT') >= float('$TARGET_PROFIT') else 'no')" 2>/dev/null || echo "no")
+        if [ "$TARGET_MET" = "yes" ]; then
+            return 0  # Target achieved
+        fi
+    fi
+    return 1  # Target not achieved
+}
+
+# Function to run one optimization cycle
+run_optimization_cycle() {
+    eval "$DOCKER_CMD"
+    return $?
+}
+
 if [ "$RUN_BACKGROUND" = true ]; then
     echo "Starting optimization in background..."
     echo "Logs will be written to: user_data/optimizer.log"
     echo ""
 
-    # Run in background with logging
-    nohup bash -c "$DOCKER_CMD" > "$SCRIPT_DIR/user_data/optimizer.log" 2>&1 &
+    if [ "$RUN_FOREVER" = true ]; then
+        # Run forever loop in background
+        nohup bash -c "
+            cd '$SCRIPT_DIR'
+            CYCLE=1
+            while true; do
+                echo ''
+                echo '============================================================'
+                echo \"FOREVER MODE - Cycle \$CYCLE started at \$(date)\"
+                echo '============================================================'
+
+                # Run the optimization
+                $DOCKER_CMD
+                EXIT_CODE=\$?
+
+                # Check if target was achieved
+                if [ -f 'user_data/optimization_report.json' ]; then
+                    BEST_PROFIT=\$(python3 -c \"import json; r=json.load(open('user_data/optimization_report.json')); print(r.get('summary',{}).get('best_profit', -999))\" 2>/dev/null || echo '-999')
+                    TARGET_MET=\$(python3 -c \"print('yes' if float('\$BEST_PROFIT') >= float('$TARGET_PROFIT') else 'no')\" 2>/dev/null || echo 'no')
+
+                    echo \"Cycle \$CYCLE complete. Best profit: \$BEST_PROFIT% (target: $TARGET_PROFIT%)\"
+
+                    if [ \"\$TARGET_MET\" = 'yes' ]; then
+                        echo ''
+                        echo '============================================================'
+                        echo 'TARGET PROFIT ACHIEVED! Stopping forever loop.'
+                        echo '============================================================'
+                        exit 0
+                    fi
+                fi
+
+                echo \"Target not reached. Starting cycle \$((CYCLE + 1)) in 10 seconds...\"
+                sleep 10
+                CYCLE=\$((CYCLE + 1))
+            done
+        " > "$SCRIPT_DIR/user_data/optimizer.log" 2>&1 &
+    else
+        # Run single cycle in background
+        nohup bash -c "$DOCKER_CMD" > "$SCRIPT_DIR/user_data/optimizer.log" 2>&1 &
+    fi
 
     # Wait a moment and check if it started
     sleep 2
-    CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-optimizer")
+    CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
     if [ -n "$CONTAINER_ID" ]; then
         echo "Optimizer started successfully (container: $CONTAINER_ID)"
+        if [ "$RUN_FOREVER" = true ]; then
+            echo "Running in FOREVER mode - will restart until $TARGET_PROFIT% profit is achieved"
+        fi
         echo ""
         echo "Management commands:"
         echo "  ./run_optimizer.sh --status   # Check status"
@@ -299,13 +361,47 @@ else
     echo "Starting optimization..."
     echo ""
 
-    # Run interactively
-    eval "$DOCKER_CMD"
+    if [ "$RUN_FOREVER" = true ]; then
+        # Run forever loop interactively
+        CYCLE=1
+        while true; do
+            echo ""
+            echo "============================================================"
+            echo "FOREVER MODE - Cycle $CYCLE started at $(date)"
+            echo "============================================================"
 
-    echo ""
-    echo "============================================================"
-    echo "Optimization complete!"
-    echo "Results saved in: user_data/strategies/"
-    echo "Report: user_data/optimization_report.json"
-    echo "============================================================"
+            # Run the optimization
+            run_optimization_cycle
+
+            # Check if target was achieved
+            if check_target_achieved; then
+                echo ""
+                echo "============================================================"
+                echo "TARGET PROFIT ACHIEVED! ($TARGET_PROFIT%)"
+                echo "Results saved in: user_data/strategies/"
+                echo "Report: user_data/optimization_report.json"
+                echo "============================================================"
+                exit 0
+            fi
+
+            # Get current best profit for display
+            BEST_PROFIT=$(python3 -c "import json; r=json.load(open('$SCRIPT_DIR/user_data/optimization_report.json')); print(r.get('summary',{}).get('best_profit', -999))" 2>/dev/null || echo "unknown")
+            echo ""
+            echo "Cycle $CYCLE complete. Best profit: $BEST_PROFIT% (target: $TARGET_PROFIT%)"
+            echo "Target not reached. Starting cycle $((CYCLE + 1)) in 10 seconds..."
+            echo "(Press Ctrl+C to stop)"
+            sleep 10
+            CYCLE=$((CYCLE + 1))
+        done
+    else
+        # Run single cycle interactively
+        run_optimization_cycle
+
+        echo ""
+        echo "============================================================"
+        echo "Optimization complete!"
+        echo "Results saved in: user_data/strategies/"
+        echo "Report: user_data/optimization_report.json"
+        echo "============================================================"
+    fi
 fi

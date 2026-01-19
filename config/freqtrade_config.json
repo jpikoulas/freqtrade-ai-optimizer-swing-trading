@@ -1,7 +1,7 @@
 {
     "trading_mode": "spot",
     "margin_mode": "",
-    "max_open_trades": 3,
+    "max_open_trades": 2,
     "stake_currency": "USDT",
     "stake_amount": "unlimited",
     "tradable_balance_ratio": 0.99,
@@ -9,10 +9,10 @@
     "dry_run": true,
     "dry_run_wallet": 1000,
     "cancel_open_orders_on_exit": false,
-    "timeframe": "5m",
+    "timeframe": "1h",
     "unfilledtimeout": {
-        "entry": 10,
-        "exit": 10,
+        "entry": 60,
+        "exit": 60,
         "exit_timeout_count": 0,
         "unit": "minutes"
     },
@@ -47,7 +47,7 @@
             "method": "StaticPairList"
         }
     ],
-    "bot_name": "freqtrade-ai-optimizer",
+    "bot_name": "freqtrade-swing-trading",
     "initial_state": "running",
     "force_entry_enable": false,
     "internals": {
