@@ -42,8 +42,8 @@ services:
       download-data
       --exchange binance
       --pairs BTC/USDT ETH/USDT
-      --timeframe 1m 5m 15m
-      --days 60
+      --timeframe 1m 5m 15m 1h
+      --days 90
       --datadir /freqtrade/user_data/data
     profiles:
       - download
