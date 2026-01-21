@@ -2,10 +2,17 @@
 """
 FreqTrade AI Strategy Optimizer - Local Runner with Hyperopt
 Uses hyperopt for parameter optimization, then DeepSeek for strategy improvements.
+
+Features:
+- Crash recovery: Saves state after each iteration
+- Graceful shutdown: Saves best strategy on SIGTERM/SIGINT
+- Resume from best: Automatically resumes from best strategy on restart
 """
+import atexit
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -36,8 +43,242 @@ HYPEROPT_EPOCHS = int(os.environ.get("HYPEROPT_EPOCHS", "100"))
 # deepseek-reasoner can overthink and generate overly complex conditions
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
+# Slack webhook URL for notifications (optional)
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+
 # Consecutive zero-trade threshold before resetting to base strategy
 ZERO_TRADE_RESET_THRESHOLD = 2
+
+# State file for crash recovery
+STATE_FILE = USER_DATA_DIR / ".optimizer_state.json"
+
+# Global state for signal handlers
+_shutdown_requested = False
+_current_best_strategy = None
+_current_best_profit = float('-inf')
+
+
+def send_slack_notification(message: str, emoji: str = ":chart_with_upwards_trend:"):
+    """Send a notification to Slack via webhook."""
+    if not SLACK_WEBHOOK_URL:
+        return  # Slack not configured, silently skip
+
+    import urllib.request
+    import urllib.error
+
+    payload = {
+        "text": message,
+        "icon_emoji": emoji,
+        "username": "FreqTrade Swing Optimizer"
+    }
+
+    try:
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=data,
+            headers={'Content-Type': 'application/json'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.status == 200:
+                print("  Slack notification sent")
+            else:
+                print(f"  Slack notification failed: {response.status}")
+    except urllib.error.URLError as e:
+        print(f"  Slack notification failed: {e}")
+    except Exception as e:
+        print(f"  Slack notification error: {e}")
+
+
+def notify_new_best(results: dict, iteration: int, previous_best: float):
+    """Send Slack notification for new best result."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    emoji = ":rocket:" if results["total_profit_pct"] >= 5 else ":chart_with_upwards_trend:" if results["total_profit_pct"] >= 0 else ":chart_with_downwards_trend:"
+
+    message = f"""*:dart: New Best SWING Strategy Found!*
+*Time:* {timestamp}
+*Iteration:* {iteration}
+
+```
+Results:
+  Total Trades: {results['total_trades']}
+  Total Profit: {results['total_profit_pct']:.2f}%
+  Win Rate: {results['win_rate']:.2f}%
+  Max Drawdown: {results['max_drawdown_pct']:.2f}%
+  Sharpe Ratio: {results['sharpe_ratio']:.2f}
+  Avg Profit/Trade: {results['avg_profit_pct']:.2f}%
+  *** New best: {results['total_profit_pct']:.2f}% ***
+```
+_Previous best: {previous_best:.2f}%_"""
+
+    send_slack_notification(message, emoji)
+
+
+def notify_target_achieved(results: dict, iteration: int):
+    """Send Slack notification when target profit is achieved."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    message = f"""*:trophy: SWING TARGET PROFIT ACHIEVED! :tada:*
+*Time:* {timestamp}
+*Iteration:* {iteration}
+
+```
+Final Results:
+  Total Trades: {results['total_trades']}
+  Total Profit: {results['total_profit_pct']:.2f}%
+  Win Rate: {results['win_rate']:.2f}%
+  Max Drawdown: {results['max_drawdown_pct']:.2f}%
+  Sharpe Ratio: {results['sharpe_ratio']:.2f}
+  Avg Profit/Trade: {results['avg_profit_pct']:.2f}%
+```
+*Target was: {TARGET_PROFIT}%*
+:star: Optimization complete!"""
+
+    send_slack_notification(message, ":trophy:")
+
+
+def notify_optimizer_started():
+    """Send Slack notification when optimizer starts."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    message = f"""*:rocket: FreqTrade SWING Optimizer Started*
+*Time:* {timestamp}
+
+```
+Configuration:
+  Target Profit: {TARGET_PROFIT}%
+  Max Iterations: {MAX_ITERATIONS}
+  Backtest Days: {BACKTEST_DAYS}
+  Hyperopt Epochs: {HYPEROPT_EPOCHS}
+  AI Model: {DEEPSEEK_MODEL}
+  Timeframe: 1h (Swing Trading)
+```"""
+
+    send_slack_notification(message, ":rocket:")
+
+
+def load_optimizer_state():
+    """Load optimizer state from crash recovery file."""
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            print(f"Loaded state from {STATE_FILE}")
+            return state
+        except Exception as e:
+            print(f"Could not load state: {e}")
+    return None
+
+
+def save_optimizer_state(iteration, best_profit, best_strategy, iteration_results, consecutive_zero_trades=0):
+    """Save optimizer state for crash recovery."""
+    global _current_best_strategy, _current_best_profit
+    _current_best_strategy = best_strategy
+    _current_best_profit = best_profit
+
+    state = {
+        "iteration": iteration,
+        "best_profit": best_profit,
+        "consecutive_zero_trades": consecutive_zero_trades,
+        "iteration_results": iteration_results,
+        "timestamp": datetime.now().isoformat(),
+    }
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save state: {e}")
+
+
+def save_best_strategy_immediately(strategy, profit, reason="shutdown"):
+    """Save the best strategy immediately (used during shutdown)."""
+    if strategy is None:
+        return
+
+    backup_dir = USER_DATA_DIR / "strategy_backups"
+    backup_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f"FreqAIStrategy_{reason}_{profit:.1f}pct_{timestamp}.py"
+    filepath = backup_dir / filename
+
+    try:
+        with open(filepath, 'w') as f:
+            f.write(strategy)
+        print(f"Saved best strategy to {filepath}")
+    except Exception as e:
+        print(f"Warning: Could not save strategy: {e}")
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global _shutdown_requested
+    signal_name = signal.Signals(signum).name
+    print(f"\n{'='*60}")
+    print(f"Received {signal_name} - initiating graceful shutdown...")
+    print(f"{'='*60}")
+
+    _shutdown_requested = True
+
+    # Save best strategy immediately
+    if _current_best_strategy:
+        save_best_strategy_immediately(_current_best_strategy, _current_best_profit, "graceful_stop")
+
+    print("Shutdown complete. Best strategy saved.")
+    sys.exit(0)
+
+
+def cleanup_handler():
+    """Cleanup handler called on exit."""
+    if _current_best_strategy and not _shutdown_requested:
+        print("Saving best strategy on exit...")
+        save_best_strategy_immediately(_current_best_strategy, _current_best_profit, "exit")
+
+
+def check_and_download_data():
+    """Check if data exists and download if needed."""
+    data_dir = USER_DATA_DIR / "data" / "binance"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check for existing data files
+    data_files = list(data_dir.glob("*.json.gz")) + list(data_dir.glob("*.json"))
+    if data_files:
+        print(f"Found {len(data_files)} existing data files")
+        return True
+
+    print("No data found, downloading...")
+    return download_data()
+
+
+def download_data():
+    """Download historical data using freqtrade."""
+    timerange = get_timerange()
+
+    cmd = [
+        "docker", "compose", "run", "--rm",
+        "freqtrade",
+        "download-data",
+        "--config", "/freqtrade/config/freqtrade_config.json",
+        "--timerange", timerange,
+        "--timeframe", "1h",  # Swing trading uses 1h
+    ]
+
+    print(f"Downloading data for timerange {timerange}...")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                                cwd=PROJECT_DIR, env=get_docker_env())
+        if result.returncode != 0:
+            print(f"Data download failed: {result.stderr}")
+            return False
+        print("Data download complete")
+        return True
+    except subprocess.TimeoutExpired:
+        print("Data download timed out")
+        return False
+    except Exception as e:
+        print(f"Error downloading data: {e}")
+        return False
 
 
 def get_timerange():
@@ -491,6 +732,13 @@ Return ONLY the complete Python code. No explanations."""
 
 
 def main():
+    global _current_best_strategy, _current_best_profit
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    atexit.register(cleanup_handler)
+
     from dotenv import load_dotenv
     load_dotenv(PROJECT_DIR / ".env")
 
@@ -510,10 +758,46 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     HYPEROPT_DIR.mkdir(parents=True, exist_ok=True)
     (USER_DATA_DIR / "strategies").mkdir(parents=True, exist_ok=True)
+    (USER_DATA_DIR / "strategy_backups").mkdir(parents=True, exist_ok=True)
 
-    # Copy initial strategy
-    initial_strategy = STRATEGIES_DIR / "FreqAIStrategy.py"
-    shutil.copy2(initial_strategy, USER_DATA_DIR / "strategies" / "FreqAIStrategy.py")
+    # Check and download data if needed
+    if not check_and_download_data():
+        print("WARNING: Could not verify data. Backtest may fail.")
+
+    # Check for existing state (crash recovery)
+    saved_state = load_optimizer_state()
+    start_iteration = 1
+    best_profit = float('-inf')
+    best_strategy = None
+    iteration_results = []
+    consecutive_zero_trades = 0
+
+    if saved_state:
+        print(f"\n{'='*60}")
+        print("RESUMING FROM SAVED STATE")
+        print(f"{'='*60}")
+        start_iteration = saved_state.get("iteration", 0) + 1
+        best_profit = saved_state.get("best_profit", float('-inf'))
+        iteration_results = saved_state.get("iteration_results", [])
+        consecutive_zero_trades = saved_state.get("consecutive_zero_trades", 0)
+        print(f"Resuming from iteration {start_iteration}")
+        print(f"Previous best profit: {best_profit:.2f}%")
+        print(f"{'='*60}\n")
+
+    # Load best strategy if exists, otherwise copy initial
+    best_backup = USER_DATA_DIR / "strategy_backups"
+    best_files = sorted(best_backup.glob("FreqAIStrategy_best_*.py"), key=lambda x: x.stat().st_mtime, reverse=True)
+    if best_files and saved_state:
+        print(f"Loading best strategy from {best_files[0]}")
+        with open(best_files[0]) as f:
+            best_strategy = f.read()
+        # Use best strategy as current
+        with open(USER_DATA_DIR / "strategies" / "FreqAIStrategy.py", 'w') as f:
+            f.write(best_strategy)
+    else:
+        # Copy initial strategy
+        initial_strategy = STRATEGIES_DIR / "FreqAIStrategy.py"
+        shutil.copy2(initial_strategy, USER_DATA_DIR / "strategies" / "FreqAIStrategy.py")
 
     print("=" * 60)
     print("FreqTrade SWING TRADING Optimizer (Hyperopt + DeepSeek)")
@@ -523,18 +807,30 @@ def main():
     print(f"Max iterations: {MAX_ITERATIONS}")
     print(f"Hyperopt epochs per iteration: {HYPEROPT_EPOCHS}")
     print(f"AI Model: DeepSeek ({DEEPSEEK_MODEL})")
+    if saved_state:
+        print(f"Resuming from: iteration {start_iteration}")
     print("=" * 60)
+
+    # Send startup notification
+    notify_optimizer_started()
 
     # Load current strategy
     with open(USER_DATA_DIR / "strategies" / "FreqAIStrategy.py") as f:
         current_strategy = f.read()
 
-    best_profit = float('-inf')
-    best_strategy = current_strategy
-    iteration_results = []
-    consecutive_zero_trades = 0  # Track consecutive iterations with 0 trades
+    if best_strategy is None:
+        best_strategy = current_strategy
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
+    # Update global state for signal handlers
+    _current_best_strategy = best_strategy
+    _current_best_profit = best_profit
+
+    for iteration in range(start_iteration, MAX_ITERATIONS + 1):
+        # Check for shutdown request
+        if _shutdown_requested:
+            print("Shutdown requested, exiting loop...")
+            break
+
         print(f"\n{'='*60}")
         print(f"ITERATION {iteration}/{MAX_ITERATIONS}")
         print(f"{'='*60}")
@@ -592,15 +888,29 @@ def main():
 
         # Track best (only if we have trades)
         if results["total_trades"] > 0 and results["total_profit_pct"] > best_profit:
+            previous_best = best_profit
             best_profit = results["total_profit_pct"]
             best_strategy = current_strategy
+            _current_best_strategy = best_strategy
+            _current_best_profit = best_profit
             print(f"  *** New best: {best_profit:.2f}% ***")
+
+            # Send Slack notification for new best
+            notify_new_best(results, iteration, previous_best)
+
+            # Save best strategy immediately
+            backup_dir = USER_DATA_DIR / "strategy_backups"
+            with open(backup_dir / f"FreqAIStrategy_best_{best_profit:.1f}pct.py", 'w') as f:
+                f.write(best_strategy)
 
         # Check target - lower trade requirement for swing trading
         if results["total_profit_pct"] >= TARGET_PROFIT and results["total_trades"] >= 10:
             print(f"\n{'='*60}")
             print(f"TARGET ACHIEVED! Profit: {results['total_profit_pct']:.2f}%")
             print(f"{'='*60}")
+
+            # Send Slack notification for target achieved
+            notify_target_achieved(results, iteration)
 
             # Save winning strategy to backup directory
             backup_dir = USER_DATA_DIR / "strategy_backups"
@@ -637,6 +947,9 @@ def main():
             # Update main strategy (the only file in strategies/ with this class)
             with open(USER_DATA_DIR / "strategies" / "FreqAIStrategy.py", 'w') as f:
                 f.write(current_strategy)
+
+        # Save state for crash recovery after each iteration
+        save_optimizer_state(iteration, best_profit, best_strategy, iteration_results, consecutive_zero_trades)
 
     # Save report
     report = {

@@ -17,6 +17,14 @@
 
 set -e
 
+# Get script directory early for PID file location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Ensure user_data directory exists for PID file
+mkdir -p "$SCRIPT_DIR/user_data"
+
+PID_FILE="$SCRIPT_DIR/user_data/.optimizer.pid"
+
 # Default values
 MAX_ITERATIONS=10
 TARGET_PROFIT=5.0
@@ -61,22 +69,40 @@ while [[ $# -gt 0 ]]; do
             ;;
         --status)
             # Show status of running optimizer
-            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
+            RUNNING=false
+
+            # Check for background process
+            if [ -f "$PID_FILE" ]; then
+                BG_PID=$(cat "$PID_FILE" 2>/dev/null)
+                if kill -0 "$BG_PID" 2>/dev/null; then
+                    echo "Background process running (PID: $BG_PID)"
+                    RUNNING=true
+                else
+                    echo "Stale PID file found (process $BG_PID not running)"
+                    rm -f "$PID_FILE" 2>/dev/null || true
+                fi
+            fi
+
+            # Check for Docker container
+            CONTAINER_ID=$(docker ps -q --filter "name=freqtrade-swing-optimizer")
             if [ -n "$CONTAINER_ID" ]; then
-                echo "Optimizer is running (container: $CONTAINER_ID)"
+                echo "Docker container running (ID: $CONTAINER_ID)"
+                RUNNING=true
                 echo ""
                 echo "Recent logs:"
-                sudo docker logs --tail 50 "$CONTAINER_ID"
-            else
+                docker logs --tail 50 "$CONTAINER_ID"
+            fi
+
+            if [ "$RUNNING" = false ]; then
                 echo "No optimizer is currently running"
             fi
             exit 0
             ;;
         --logs)
             # Follow logs of running optimizer
-            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
+            CONTAINER_ID=$(docker ps -q --filter "name=freqtrade-swing-optimizer")
             if [ -n "$CONTAINER_ID" ]; then
-                sudo docker logs -f "$CONTAINER_ID"
+                docker logs -f "$CONTAINER_ID"
             else
                 echo "No optimizer is currently running"
                 echo "Check log file: user_data/optimizer.log"
@@ -84,12 +110,50 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         --stop)
-            # Stop running optimizer
-            CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
+            # Stop running optimizer - kill both container and background process
+            STOPPED=false
+
+            # First, kill the background process if PID file exists
+            if [ -f "$PID_FILE" ]; then
+                BG_PID=$(cat "$PID_FILE" 2>/dev/null)
+                if kill -0 "$BG_PID" 2>/dev/null; then
+                    echo "Stopping background process (PID: $BG_PID)..."
+                    kill "$BG_PID" 2>/dev/null || true
+                    # Wait a moment for graceful shutdown
+                    sleep 1
+                    # Force kill if still running
+                    if kill -0 "$BG_PID" 2>/dev/null; then
+                        echo "Force killing background process..."
+                        kill -9 "$BG_PID" 2>/dev/null || true
+                    fi
+                    STOPPED=true
+                fi
+                rm -f "$PID_FILE" 2>/dev/null || true
+            fi
+
+            # Also stop the Docker container if running
+            CONTAINER_ID=$(docker ps -q --filter "name=freqtrade-swing-optimizer")
             if [ -n "$CONTAINER_ID" ]; then
-                echo "Stopping optimizer..."
-                sudo docker stop "$CONTAINER_ID"
-                echo "Optimizer stopped"
+                echo "Stopping Docker container ($CONTAINER_ID)..."
+                docker stop "$CONTAINER_ID" 2>/dev/null || true
+                STOPPED=true
+            fi
+
+            # Also kill any orphaned nohup processes running this script's docker command
+            ORPHAN_PIDS=$(pgrep -f "freqtrade-swing-optimizer" 2>/dev/null || true)
+            if [ -n "$ORPHAN_PIDS" ]; then
+                for pid in $ORPHAN_PIDS; do
+                    # Don't kill this script itself
+                    if [ "$pid" != "$$" ]; then
+                        echo "Killing orphaned process (PID: $pid)..."
+                        kill "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+                        STOPPED=true
+                    fi
+                done
+            fi
+
+            if [ "$STOPPED" = true ]; then
+                echo "Optimizer stopped successfully"
             else
                 echo "No optimizer is currently running"
             fi
@@ -130,8 +194,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Get script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Change to script directory
 cd "$SCRIPT_DIR"
 
 # Check for .env file
@@ -150,13 +213,13 @@ if [ -z "$DEEPSEEK_API_KEY" ]; then
 fi
 
 # Check Docker is running
-if ! sudo docker info > /dev/null 2>&1; then
+if ! docker info > /dev/null 2>&1; then
     echo "ERROR: Docker is not running!"
     exit 1
 fi
 
 # Check if optimizer is already running
-EXISTING_CONTAINER=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
+EXISTING_CONTAINER=$(docker ps -q --filter "name=freqtrade-swing-optimizer")
 if [ -n "$EXISTING_CONTAINER" ]; then
     echo "WARNING: Optimizer is already running (container: $EXISTING_CONTAINER)"
     echo "Use --stop to stop it first, or --logs to view its output"
@@ -165,7 +228,7 @@ fi
 
 # Build freqtrade image using docker compose if needed
 echo "Building freqtrade image..."
-sudo docker compose build freqtrade
+docker compose build freqtrade
 
 # Build the optimizer image if needed
 OPTIMIZER_IMAGE="freqtrade-swing-optimizer-runner:latest"
@@ -190,7 +253,7 @@ echo ""
 
 # Check if optimizer image exists or if run_local.py is newer
 BUILD_IMAGE=false
-if ! sudo docker image inspect "$OPTIMIZER_IMAGE" > /dev/null 2>&1; then
+if ! docker image inspect "$OPTIMIZER_IMAGE" > /dev/null 2>&1; then
     BUILD_IMAGE=true
 elif [ "run_local.py" -nt ".optimizer_image_built" ] 2>/dev/null; then
     BUILD_IMAGE=true
@@ -208,7 +271,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     gnupg \
-    sudo \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
     && chmod a+r /etc/apt/keyrings/docker.gpg \
@@ -216,9 +278,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
-
-# Allow running docker commands with sudo without password
-RUN echo "ALL ALL=(ALL) NOPASSWD: /usr/bin/docker" >> /etc/sudoers
 
 WORKDIR /app
 
@@ -235,7 +294,7 @@ COPY docker-compose.yml /app/
 CMD ["python", "-u", "run_local.py"]
 DOCKERFILE
 
-    sudo docker build -f Dockerfile.optimizer -t "$OPTIMIZER_IMAGE" .
+    docker build -f Dockerfile.optimizer -t "$OPTIMIZER_IMAGE" .
     rm -f Dockerfile.optimizer
     touch .optimizer_image_built
     echo "Optimizer image built successfully"
@@ -254,7 +313,7 @@ if [ ! -f "user_data/strategies/FreqAIStrategy.py" ]; then
 fi
 
 # Build docker run command
-DOCKER_CMD="sudo docker run --rm \
+DOCKER_CMD="docker run --rm \
     --name freqtrade-swing-optimizer \
     -v $SCRIPT_DIR/user_data:/app/user_data \
     -v $SCRIPT_DIR/config:/app/config \
@@ -262,6 +321,7 @@ DOCKER_CMD="sudo docker run --rm \
     -v $SCRIPT_DIR/docker-compose.yml:/app/docker-compose.yml \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -e DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY \
+    -e SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-} \
     -e MAX_ITERATIONS=$MAX_ITERATIONS \
     -e TARGET_PROFIT=$TARGET_PROFIT \
     -e BACKTEST_DAYS=$BACKTEST_DAYS \
@@ -297,51 +357,49 @@ if [ "$RUN_BACKGROUND" = true ]; then
     echo "Logs will be written to: user_data/optimizer.log"
     echo ""
 
-    if [ "$RUN_FOREVER" = true ]; then
-        # Run forever loop in background
-        nohup bash -c "
-            cd '$SCRIPT_DIR'
-            CYCLE=1
-            while true; do
-                echo ''
-                echo '============================================================'
-                echo \"FOREVER MODE - Cycle \$CYCLE started at \$(date)\"
-                echo '============================================================'
+    # Clean up any stale PID file
+    rm -f "$PID_FILE" 2>/dev/null || true
 
-                # Run the optimization
-                $DOCKER_CMD
-                EXIT_CODE=\$?
-
-                # Check if target was achieved
-                if [ -f 'user_data/optimization_report.json' ]; then
-                    BEST_PROFIT=\$(python3 -c \"import json; r=json.load(open('user_data/optimization_report.json')); print(r.get('summary',{}).get('best_profit', -999))\" 2>/dev/null || echo '-999')
-                    TARGET_MET=\$(python3 -c \"print('yes' if float('\$BEST_PROFIT') >= float('$TARGET_PROFIT') else 'no')\" 2>/dev/null || echo 'no')
-
-                    echo \"Cycle \$CYCLE complete. Best profit: \$BEST_PROFIT% (target: $TARGET_PROFIT%)\"
-
-                    if [ \"\$TARGET_MET\" = 'yes' ]; then
-                        echo ''
-                        echo '============================================================'
-                        echo 'TARGET PROFIT ACHIEVED! Stopping forever loop.'
-                        echo '============================================================'
-                        exit 0
-                    fi
-                fi
-
-                echo \"Target not reached. Starting cycle \$((CYCLE + 1)) in 10 seconds...\"
-                sleep 10
-                CYCLE=\$((CYCLE + 1))
-            done
-        " > "$SCRIPT_DIR/user_data/optimizer.log" 2>&1 &
-    else
-        # Run single cycle in background
-        nohup bash -c "$DOCKER_CMD" > "$SCRIPT_DIR/user_data/optimizer.log" 2>&1 &
-    fi
+    # Run Docker in detached mode
+    docker run -d --rm \
+        --name freqtrade-swing-optimizer \
+        -v "$SCRIPT_DIR/user_data:/app/user_data" \
+        -v "$SCRIPT_DIR/config:/app/config" \
+        -v "$SCRIPT_DIR/strategies:/app/strategies" \
+        -v "$SCRIPT_DIR/docker-compose.yml:/app/docker-compose.yml" \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+        -e SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}" \
+        -e MAX_ITERATIONS="$MAX_ITERATIONS" \
+        -e TARGET_PROFIT="$TARGET_PROFIT" \
+        -e BACKTEST_DAYS="$BACKTEST_DAYS" \
+        -e HYPEROPT_EPOCHS="$HYPEROPT_EPOCHS" \
+        -e DEEPSEEK_MODEL="$DEEPSEEK_MODEL" \
+        -e PROJECT_DIR=/app \
+        -e HOST_PROJECT_DIR="$SCRIPT_DIR" \
+        --network host \
+        "$OPTIMIZER_IMAGE" > /dev/null
 
     # Wait a moment and check if it started
     sleep 2
-    CONTAINER_ID=$(sudo docker ps -q --filter "name=freqtrade-swing-optimizer")
+    CONTAINER_ID=$(docker ps -q --filter "name=freqtrade-swing-optimizer")
     if [ -n "$CONTAINER_ID" ]; then
+        # Save container ID as our "PID" for tracking (with error handling)
+        if echo "$CONTAINER_ID" > "$PID_FILE" 2>/dev/null; then
+            :  # PID file saved successfully
+        else
+            echo "Warning: Could not save PID file (permission denied)"
+            echo "The optimizer is running but --stop may not work correctly"
+        fi
+
+        # Start log streaming in background (suppress errors if log file not writable)
+        if nohup docker logs -f "$CONTAINER_ID" > "$SCRIPT_DIR/user_data/optimizer.log" 2>&1 &
+        then
+            :  # Log streaming started
+        else
+            echo "Warning: Could not write to optimizer.log (use 'docker logs -f $CONTAINER_ID' instead)"
+        fi
+
         echo "Optimizer started successfully (container: $CONTAINER_ID)"
         if [ "$RUN_FOREVER" = true ]; then
             echo "Running in FOREVER mode - will restart until $TARGET_PROFIT% profit is achieved"
@@ -351,7 +409,7 @@ if [ "$RUN_BACKGROUND" = true ]; then
         echo "  ./run_optimizer.sh --status   # Check status"
         echo "  ./run_optimizer.sh --logs     # View live logs"
         echo "  ./run_optimizer.sh --stop     # Stop optimizer"
-        echo "  tail -f user_data/optimizer.log  # Follow log file"
+        echo "  docker logs -f $CONTAINER_ID  # Follow container logs directly"
     else
         echo "ERROR: Failed to start optimizer"
         echo "Check user_data/optimizer.log for details"

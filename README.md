@@ -1,22 +1,28 @@
-# FreqTrade AI Strategy Optimizer
+# FreqTrade AI Strategy Optimizer - Swing Trading
 
-Automated system that generates, backtests, and iteratively improves FreqTrade trading strategies using DeepSeek AI and hyperparameter optimization.
+Automated system that generates, backtests, and iteratively improves FreqTrade **swing trading** strategies using DeepSeek AI and hyperparameter optimization.
+
+**Timeframe:** 1-hour (1h) - optimized for swing trades held for days to weeks.
 
 ## Features
 
+- **Swing Trading Focus**: Optimized for 1h timeframe with longer EMAs (20, 50, 100) and trend-following strategies
 - **AI-Powered Strategy Generation**: Uses DeepSeek API to analyze results and generate improved strategies
 - **Hyperopt Integration**: Automatically optimizes ROI, stoploss, and trailing stop parameters
 - **Fully Dockerized**: Runs entirely in containers - no Python installation required
 - **Automated Optimization Loop**: Backtests, analyzes, improves, repeats
 - **Smart Fallback**: Resets to base strategy after consecutive zero-trade iterations
 - **Detailed Reporting**: Tracks all iterations and saves best strategies
+- **Slack Notifications**: Get real-time alerts for new best strategies and target achievements
+- **Crash Recovery**: State is saved after each iteration, automatically resumes on restart
 
 ## Quick Start
 
 1. **Clone and setup:**
    ```bash
-   cd freqtrade-ai-optimizer
-   echo 'DEEPSEEK_API_KEY=your-key-here' > .env
+   cd freqtrade-ai-optimizer-swing-trading
+   cp .env.example .env
+   # Edit .env and add your DEEPSEEK_API_KEY
    ```
 
 2. **Run the optimizer:**
@@ -80,7 +86,39 @@ tail -f user_data/optimizer.log
 ./run_optimizer.sh --stop
 ```
 
-The optimizer runs in a named Docker container (`freqtrade-optimizer`) for easy management. Only one optimizer instance can run at a time.
+The optimizer runs in a named Docker container (`freqtrade-swing-optimizer`) for easy management. Only one optimizer instance can run at a time.
+
+## Slack Notifications
+
+When configured with a Slack webhook URL, the optimizer sends notifications for:
+
+- **Optimizer Started**: Configuration summary when optimization begins
+- **New Best Strategy**: Real-time alert when a new best profit is achieved, including full results
+- **Target Achieved**: Celebration notification when the target profit is reached
+
+Example notification:
+```
+🎯 New Best SWING Strategy Found!
+Time: 2025-01-21 14:32:15
+Iteration: 5
+
+Results:
+  Total Trades: 42
+  Total Profit: 6.78%
+  Win Rate: 61.90%
+  Max Drawdown: 5.23%
+  Sharpe Ratio: 1.82
+  Avg Profit/Trade: 1.61%
+  *** New best: 6.78% ***
+
+Previous best: 3.45%
+```
+
+To set up Slack notifications:
+1. Create a Slack app at https://api.slack.com/apps
+2. Enable Incoming Webhooks
+3. Create a webhook for your channel
+4. Add the webhook URL to your `.env` file
 
 ## Configuration
 
@@ -91,6 +129,16 @@ Create a `.env` file with:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DEEPSEEK_API_KEY` | Yes | Your DeepSeek API key |
+| `SLACK_WEBHOOK_URL` | No | Slack webhook URL for notifications |
+
+Example `.env` file:
+```bash
+DEEPSEEK_API_KEY=your-deepseek-api-key-here
+
+# Slack webhook URL for notifications (optional)
+# Get your webhook URL from: https://api.slack.com/messaging/webhooks
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+```
 
 ### FreqTrade Config
 
@@ -102,7 +150,7 @@ Edit `config/freqtrade_config.json` to customize:
 ## Project Structure
 
 ```
-freqtrade-ai-optimizer/
+freqtrade-ai-optimizer-swing-trading/
 ├── run_optimizer.sh           # Main entry point - run this!
 ├── run_local.py               # Optimization loop logic
 ├── config/
@@ -122,12 +170,20 @@ freqtrade-ai-optimizer/
 
 ## How It Works
 
-1. **Backtest**: Run strategy against historical data (default: 90 days of BTC/USDT 5m)
+1. **Backtest**: Run strategy against historical data (default: 90 days of BTC/USDT 1h)
 2. **Analyze**: Parse results (trades, profit, win rate, drawdown, Sharpe ratio)
-3. **Check Target**: If profit >= target AND trades >= 20, save winning strategy and exit
-4. **Hyperopt**: If trades >= 20, optimize ROI/stoploss/trailing parameters
-5. **AI Improve**: Send results to DeepSeek to generate improved entry/exit conditions
+3. **Check Target**: If profit >= target AND trades >= 10, save winning strategy and exit
+4. **Hyperopt**: If trades >= 10, optimize ROI/stoploss/trailing parameters
+5. **AI Improve**: Send results to DeepSeek to generate improved swing trading conditions
 6. **Repeat**: Loop until target achieved or max iterations reached
+
+### Swing Trading Strategy Characteristics
+
+- **Timeframe**: 1h candles for longer-term trend analysis
+- **EMAs**: Uses 20, 50, and 100 period EMAs for trend identification
+- **Trade Frequency**: Expects 10-50 trades over 90 days (fewer but higher quality)
+- **Profit Targets**: Larger ROI targets (5-15% per trade)
+- **Hold Duration**: Trades held for days to weeks
 
 ### Zero-Trade Fallback
 
@@ -147,15 +203,15 @@ After running, find results in:
 
 **Download more historical data:**
 ```bash
-sudo docker compose run --rm freqtrade download-data \
+docker compose run --rm freqtrade download-data \
   --config /freqtrade/config/freqtrade_config.json \
   --timerange 20240101-20260118 \
-  --timeframe 5m
+  --timeframe 1h
 ```
 
 **Run single backtest:**
 ```bash
-sudo docker compose run --rm freqtrade backtesting \
+docker compose run --rm freqtrade backtesting \
   --config /freqtrade/config/freqtrade_config.json \
   --strategy FreqAIStrategy \
   --timerange 20251020-20260118
@@ -163,7 +219,7 @@ sudo docker compose run --rm freqtrade backtesting \
 
 **Check available data:**
 ```bash
-sudo docker compose run --rm freqtrade list-data \
+docker compose run --rm freqtrade list-data \
   --config /freqtrade/config/freqtrade_config.json \
   --show-timerange
 ```
@@ -176,30 +232,41 @@ rm -f .optimizer_image_built
 
 **Build freqtrade image:**
 ```bash
-sudo docker compose build freqtrade
+docker compose build freqtrade
 ```
 
 ## Performance Notes
 
-- 5-minute timeframe with 90 days = ~25,000 candles per backtest
-- Each iteration takes 2-5 minutes (backtest + hyperopt + AI generation)
-- Full optimization (30 iterations) typically takes 1-2 hours
+- 1-hour timeframe with 90 days = ~2,160 candles per backtest
+- Backtests run faster than scalping due to fewer candles
+- Each iteration takes 1-3 minutes (backtest + hyperopt + AI generation)
+- Full optimization (30 iterations) typically takes 30-60 minutes
 - DeepSeek API calls are fast (~2-5 seconds per generation)
 
 ## Troubleshooting
 
 **Zero trades generated:**
 - The optimizer will auto-reset after 2 consecutive zero-trade iterations
+- Swing trading expects fewer trades (10-50 over 90 days) - this is normal
 - Check if entry conditions are too strict
 - Verify historical data is available for the timerange
 
 **Docker errors:**
-- Ensure Docker is running: `sudo docker info`
+- Ensure Docker is running: `docker info`
 - Check Docker socket permissions: `ls -la /var/run/docker.sock`
 
 **API errors:**
 - Verify DEEPSEEK_API_KEY is set correctly in `.env`
 - Check DeepSeek API status
+
+**Slack notifications not working:**
+- Verify SLACK_WEBHOOK_URL is correctly set in `.env`
+- Test the webhook manually with curl:
+  ```bash
+  curl -X POST -H 'Content-type: application/json' \
+    --data '{"text":"Test message"}' \
+    YOUR_WEBHOOK_URL
+  ```
 
 ## License
 
